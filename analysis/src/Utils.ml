@@ -15,6 +15,9 @@ let endsWith s suffix =
     let l = String.length s in
     p <= String.length s && String.sub s (l - p) p = suffix
 
+let isFirstCharUppercase s =
+  String.length s > 0 && Char.equal s.[0] (Char.uppercase_ascii s.[0])
+
 let cmtPosToPosition {Lexing.pos_lnum; pos_cnum; pos_bol} =
   Protocol.{line = pos_lnum - 1; character = pos_cnum - pos_bol}
 
@@ -58,15 +61,20 @@ let dumpPath path = Str.global_replace (Str.regexp_string "\\") "/" path
 let isUncurriedInternal path = startsWith (Path.name path) "Js.Fn.arity"
 
 let flattenLongIdent ?(jsx = false) ?(cutAtOffset = None) lid =
+  let extendPath s path =
+    match path with
+    | "" :: _ -> path
+    | _ -> s :: path
+  in
   let rec loop lid =
     match lid with
     | Longident.Lident txt -> ([txt], String.length txt)
     | Ldot (lid, txt) ->
       let path, offset = loop lid in
-      if Some offset = cutAtOffset then ("" :: path, offset + 1)
+      if Some offset = cutAtOffset then (extendPath "" path, offset + 1)
       else if jsx && txt = "createElement" then (path, offset)
-      else if txt = "_" then ("" :: path, offset + 1)
-      else (txt :: path, offset + 1 + String.length txt)
+      else if txt = "_" then (extendPath "" path, offset + 1)
+      else (extendPath txt path, offset + 1 + String.length txt)
     | Lapply _ -> ([], 0)
   in
   let path, _ = loop lid in
@@ -132,18 +140,79 @@ let identifyPpat pat =
   | Ppat_extension _ -> "Ppat_extension"
   | Ppat_open _ -> "Ppat_open"
 
-let identifyType type_desc =
-  match type_desc with
-  | Types.Tvar _ -> "Tvar"
-  | Tarrow _ -> "Tarrow"
-  | Ttuple _ -> "Ttuple"
-  | Tconstr _ -> "Tconstr"
-  | Tobject _ -> "Tobject"
-  | Tfield _ -> "Tfield"
-  | Tnil -> "Tnil"
-  | Tlink _ -> "Tlink"
-  | Tsubst _ -> "Tsubst"
-  | Tvariant _ -> "Tvariant"
-  | Tunivar _ -> "Tunivar"
-  | Tpoly _ -> "Tpoly"
-  | Tpackage _ -> "Tpackage"
+let rec skipWhite text i =
+  if i < 0 then 0
+  else
+    match text.[i] with
+    | ' ' | '\n' | '\r' | '\t' -> skipWhite text (i - 1)
+    | _ -> i
+
+let hasBraces attributes =
+  attributes |> List.exists (fun (loc, _) -> loc.Location.txt = "res.braces")
+
+let rec unwrapIfOption (t : Types.type_expr) =
+  match t.desc with
+  | Tlink t1 | Tsubst t1 | Tpoly (t1, []) -> unwrapIfOption t1
+  | Tconstr (Path.Pident {name = "option"}, [unwrappedType], _) -> unwrappedType
+  | _ -> t
+
+let isReactComponent (vb : Parsetree.value_binding) =
+  vb.pvb_attributes
+  |> List.exists (function
+       | {Location.txt = "react.component"}, _payload -> true
+       | _ -> false)
+
+let checkName name ~prefix ~exact =
+  if exact then name = prefix else startsWith name prefix
+
+let rec getUnqualifiedName txt =
+  match txt with
+  | Longident.Lident fieldName -> fieldName
+  | Ldot (t, _) -> getUnqualifiedName t
+  | _ -> ""
+
+let indent n text =
+  let spaces = String.make n ' ' in
+  let len = String.length text in
+  let text =
+    if len != 0 && text.[len - 1] = '\n' then String.sub text 0 (len - 1)
+    else text
+  in
+  let lines = String.split_on_char '\n' text in
+  match lines with
+  | [] -> ""
+  | [line] -> line
+  | line :: lines ->
+    line ^ "\n"
+    ^ (lines |> List.map (fun line -> spaces ^ line) |> String.concat "\n")
+
+let mkPosition (pos : Pos.t) =
+  let line, character = pos in
+  {Protocol.line; character}
+
+let rangeOfLoc (loc : Location.t) =
+  let start = loc |> Loc.start |> mkPosition in
+  let end_ = loc |> Loc.end_ |> mkPosition in
+  {Protocol.start; end_}
+
+let rec expandPath (path : Path.t) =
+  match path with
+  | Pident id -> [Ident.name id]
+  | Pdot (p, s, _) -> s :: expandPath p
+  | Papply _ -> []
+
+module Option = struct
+  let flatMap f o =
+    match o with
+    | None -> None
+    | Some v -> f v
+end
+
+let rec lastElements list =
+  match list with
+  | ([_; _] | [_] | []) as res -> res
+  | _ :: tl -> lastElements tl
+
+let lowercaseFirstChar s =
+  if String.length s = 0 then s
+  else String.mapi (fun i c -> if i = 0 then Char.lowercase_ascii c else c) s

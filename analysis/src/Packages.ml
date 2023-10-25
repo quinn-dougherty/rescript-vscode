@@ -12,12 +12,10 @@ let makePathsForModule ~projectFilesAndPaths ~dependenciesFilesAndPaths =
   pathsForModule
 
 let newBsPackage ~rootPath =
-  let bsconfig = Filename.concat rootPath "bsconfig.json" in
-  match Files.readFile bsconfig with
-  | None ->
-    Log.log ("Unable to read " ^ bsconfig);
-    None
-  | Some raw -> (
+  let rescriptJson = Filename.concat rootPath "rescript.json" in
+  let bsconfigJson = Filename.concat rootPath "bsconfig.json" in
+
+  let parseRaw raw =
     let libBs = BuildSystem.getLibBs rootPath in
     match Json.parse raw with
     | Some config -> (
@@ -29,13 +27,19 @@ let newBsPackage ~rootPath =
         | Some libBs ->
           Some
             (let namespace = FindFiles.getNamespace config in
+             let uncurried =
+               let ns = config |> Json.get "uncurried" in
+               Option.bind ns Json.bool
+             in
+             let uncurried = uncurried = Some true in
              let sourceDirectories =
                FindFiles.getSourceDirectories ~includeDev:true ~baseDir:rootPath
                  config
              in
              let projectFilesAndPaths =
-               FindFiles.findProjectFiles ~namespace ~path:rootPath
-                 ~sourceDirectories ~libBs
+               FindFiles.findProjectFiles
+                 ~public:(FindFiles.getPublic config)
+                 ~namespace ~path:rootPath ~sourceDirectories ~libBs
              in
              projectFilesAndPaths
              |> List.iter (fun (_name, paths) -> Log.log (showPaths paths));
@@ -51,7 +55,8 @@ let newBsPackage ~rootPath =
                  Log.log
                    ("############ Namespaced as " ^ namespace ^ " at " ^ cmt);
                  Hashtbl.add pathsForModule namespace (Namespace {cmt});
-                 [FindFiles.nameSpaceToName namespace]
+                 let path = [FindFiles.nameSpaceToName namespace] in
+                 [path]
              in
              Log.log
                ("Dependency dirs: "
@@ -69,16 +74,24 @@ let newBsPackage ~rootPath =
                        let parts = String.split_on_char ' ' s in
                        match parts with
                        | "-open" :: name :: _ ->
-                         let names = name |> String.split_on_char '.' in
-                         names @ opens
+                         let path = name |> String.split_on_char '.' in
+                         path :: opens
                        | _ -> opens))
                    [] l
                | None -> []
              in
              let opens =
-               List.rev_append opens_from_bsc_flags opens_from_namespace
+               [
+                 (if uncurried then "PervasivesU" else "Pervasives");
+                 "JsxModules";
+               ]
+               :: opens_from_namespace
+               |> List.rev_append opens_from_bsc_flags
+               |> List.map (fun path -> path @ ["place holder"])
              in
-             Log.log ("Opens from bsconfig: " ^ (opens |> String.concat " "));
+             Log.log
+               ("Opens from ReScript config file: "
+               ^ (opens |> List.map pathToString |> String.concat " "));
              {
                rootPath;
                projectFiles =
@@ -88,16 +101,81 @@ let newBsPackage ~rootPath =
                pathsForModule;
                opens;
                namespace;
+               builtInCompletionModules =
+                 (if
+                  opens_from_bsc_flags
+                  |> List.find_opt (fun opn ->
+                         match opn with
+                         | ["RescriptCore"] -> true
+                         | _ -> false)
+                  |> Option.is_some
+                 then
+                  {
+                    arrayModulePath = ["Array"];
+                    optionModulePath = ["Option"];
+                    stringModulePath = ["String"];
+                    intModulePath = ["Int"];
+                    floatModulePath = ["Float"];
+                    promiseModulePath = ["Promise"];
+                    listModulePath = ["List"];
+                    resultModulePath = ["Result"];
+                    exnModulePath = ["Exn"];
+                  }
+                 else if
+                 opens_from_bsc_flags
+                 |> List.find_opt (fun opn ->
+                        match opn with
+                        | ["Belt"] -> true
+                        | _ -> false)
+                 |> Option.is_some
+                then
+                   {
+                     arrayModulePath = ["Array"];
+                     optionModulePath = ["Option"];
+                     stringModulePath = ["Js"; "String2"];
+                     intModulePath = ["Int"];
+                     floatModulePath = ["Float"];
+                     promiseModulePath = ["Js"; "Promise"];
+                     listModulePath = ["List"];
+                     resultModulePath = ["Result"];
+                     exnModulePath = ["Js"; "Exn"];
+                   }
+                 else
+                   {
+                     arrayModulePath = ["Js"; "Array2"];
+                     optionModulePath = ["Belt"; "Option"];
+                     stringModulePath = ["Js"; "String2"];
+                     intModulePath = ["Belt"; "Int"];
+                     floatModulePath = ["Belt"; "Float"];
+                     promiseModulePath = ["Js"; "Promise"];
+                     listModulePath = ["Belt"; "List"];
+                     resultModulePath = ["Belt"; "Result"];
+                     exnModulePath = ["Js"; "Exn"];
+                   });
+               uncurried;
              })))
-    | None -> None)
+    | None -> None
+  in
+
+  match Files.readFile rescriptJson with
+  | Some raw -> parseRaw raw
+  | None -> (
+    Log.log ("Unable to read " ^ rescriptJson);
+    match Files.readFile bsconfigJson with
+    | Some raw -> parseRaw raw
+    | None ->
+      Log.log ("Unable to read " ^ bsconfigJson);
+      None)
 
 let findRoot ~uri packagesByRoot =
   let path = Uri.toPath uri in
   let rec loop path =
     if path = "/" then None
     else if Hashtbl.mem packagesByRoot path then Some (`Root path)
-    else if Files.exists (Filename.concat path "bsconfig.json") then
-      Some (`Bs path)
+    else if
+      Files.exists (Filename.concat path "rescript.json")
+      || Files.exists (Filename.concat path "bsconfig.json")
+    then Some (`Bs path)
     else
       let parent = Filename.dirname path in
       if parent = path then (* reached root *) None else loop parent

@@ -2,21 +2,52 @@ let str s = if s = "" then "\"\"" else s
 let list l = "[" ^ (l |> List.map str |> String.concat ", ") ^ "]"
 let ident l = l |> List.map str |> String.concat "."
 
-type modulePath =
-  | File of Uri.t * string
-  | NotVisible
-  | IncludedModule of Path.t * modulePath
-  | ExportedModule of string * modulePath
+type path = string list
 
-type field = {stamp: int; fname: string Location.loc; typ: Types.type_expr}
+type typedFnArg = Asttypes.arg_label * Types.type_expr
+
+let pathToString (path : path) = path |> String.concat "."
+
+module ModulePath = struct
+  type t =
+    | File of Uri.t * string
+    | NotVisible
+    | IncludedModule of Path.t * t
+    | ExportedModule of {name: string; modulePath: t; isType: bool}
+
+  let toPath modulePath tipName : path =
+    let rec loop modulePath current =
+      match modulePath with
+      | File _ -> current
+      | IncludedModule (_, inner) -> loop inner current
+      | ExportedModule {name; modulePath = inner} -> loop inner (name :: current)
+      | NotVisible -> current
+    in
+    loop modulePath [tipName]
+end
+
+type field = {
+  stamp: int;
+  fname: string Location.loc;
+  typ: Types.type_expr;
+  optional: bool;
+  docstring: string list;
+  deprecated: string option;
+}
+
+type constructorArgs =
+  | InlineRecord of field list
+  | Args of (Types.type_expr * Location.t) list
 
 module Constructor = struct
   type t = {
     stamp: int;
     cname: string Location.loc;
-    args: (Types.type_expr * Location.t) list;
+    args: constructorArgs;
     res: Types.type_expr option;
     typeDecl: string * Types.type_declaration;
+    docstring: string list;
+    deprecated: string option;
   }
 end
 
@@ -28,7 +59,12 @@ module Type = struct
     | Record of field list
     | Variant of Constructor.t list
 
-  type t = {kind: kind; decl: Types.type_declaration}
+  type t = {
+    kind: kind;
+    decl: Types.type_declaration;
+    name: string;
+    attributes: Parsetree.attributes;
+  }
 end
 
 module Exported = struct
@@ -86,12 +122,19 @@ module Module = struct
     | Type of Type.t * Types.rec_status
     | Module of t
 
-  and item = {kind: kind; name: string}
+  and item = {
+    kind: kind;
+    name: string;
+    docstring: string list;
+    deprecated: string option;
+  }
 
   and structure = {
+    name: string;
     docstring: string list;
     exported: Exported.t;
     items: item list;
+    deprecated: string option
   }
 
   and t = Ident of Path.t | Structure of structure | Constraint of t * t
@@ -102,7 +145,7 @@ module Declared = struct
     name: string Location.loc;
     extentLoc: Location.t;
     stamp: int;
-    modulePath: modulePath;
+    modulePath: ModulePath.t;
     isExported: bool;
     deprecated: string option;
     docstring: string list;
@@ -210,54 +253,115 @@ module File = struct
       uri;
       stamps = Stamps.init ();
       moduleName;
-      structure = {docstring = []; exported = Exported.init (); items = []};
+      structure =
+        {
+          name = moduleName;
+          docstring = [];
+          exported = Exported.init ();
+          items = [];
+          deprecated = None
+        };
     }
 end
 
-module QueryEnv = struct
-  type t = {file: File.t; exported: Exported.t}
-
-  let fromFile file = {file; exported = file.structure.exported}
-end
-
-module Completion = struct
-  type kind =
-    | Module of Module.t
-    | Value of Types.type_expr
-    | ObjLabel of Types.type_expr
-    | Label of string
-    | Type of Type.t
-    | Constructor of Constructor.t * string
-    | Field of field * string
-    | FileModule of string
-
-  type t = {
-    name: string;
-    env: QueryEnv.t;
-    deprecated: string option;
-    docstring: string list;
-    kind: kind;
+module QueryEnv : sig
+  type t = private {
+    file: File.t;
+    exported: Exported.t;
+    pathRev: path;
+    parent: t option;
   }
+  val fromFile : File.t -> t
+  val enterStructure : t -> Module.structure -> t
 
-  let create ~name ~kind ~env =
-    {name; env; deprecated = None; docstring = []; kind}
+  (* Express a path starting from the module represented by the env.
+     E.g. the env is at A.B.C and the path is D.
+     The result is A.B.C.D if D is inside C.
+     Or A.B.D or A.D or D if it's in one of its parents. *)
+  val pathFromEnv : t -> path -> bool * path
 
-  (* https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textDocument_completion *)
-  (* https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind *)
-  let kindToInt kind =
-    match kind with
-    | Module _ -> 9
-    | FileModule _ -> 9
-    | Constructor (_, _) -> 4
-    | ObjLabel _ -> 4
-    | Label _ -> 4
-    | Field (_, _) -> 5
-    | Type _ -> 22
-    | Value _ -> 12
+  val toString : t -> string
+end = struct
+  type t = {file: File.t; exported: Exported.t; pathRev: path; parent: t option}
+
+  let toString {file; pathRev} =
+    file.moduleName :: List.rev pathRev |> String.concat "."
+
+  let fromFile (file : File.t) =
+    {file; exported = file.structure.exported; pathRev = []; parent = None}
+
+  (* Prune a path and find a parent environment that contains the module name *)
+  let rec prunePath pathRev env name =
+    if Exported.find env.exported Module name <> None then (true, pathRev)
+    else
+      match (pathRev, env.parent) with
+      | _ :: rest, Some env -> prunePath rest env name
+      | _ -> (false, [])
+
+  let pathFromEnv env path =
+    match path with
+    | [] -> (true, env.pathRev |> List.rev)
+    | name :: _ ->
+      let found, prunedPathRev = prunePath env.pathRev env name in
+      (found, List.rev_append prunedPathRev path)
+
+  let enterStructure env (structure : Module.structure) =
+    let name = structure.name in
+    let pathRev = name :: snd (prunePath env.pathRev env name) in
+    {env with exported = structure.exported; pathRev; parent = Some env}
 end
+
+type polyVariantConstructor = {name: string; args: Types.type_expr list}
+
+type innerType = TypeExpr of Types.type_expr | ExtractedType of completionType
+and completionType =
+  | Tuple of QueryEnv.t * Types.type_expr list * Types.type_expr
+  | Texn of QueryEnv.t
+  | Tpromise of QueryEnv.t * Types.type_expr
+  | Toption of QueryEnv.t * innerType
+  | Tbool of QueryEnv.t
+  | Tarray of QueryEnv.t * innerType
+  | Tstring of QueryEnv.t
+  | Tvariant of {
+      env: QueryEnv.t;
+      constructors: Constructor.t list;
+      variantDecl: Types.type_declaration;
+      variantName: string;
+      typeArgs: Types.type_expr list;
+      typeParams: Types.type_expr list;
+    }
+  | Tpolyvariant of {
+      env: QueryEnv.t;
+      constructors: polyVariantConstructor list;
+      typeExpr: Types.type_expr;
+    }
+  | Trecord of {
+      env: QueryEnv.t;
+      fields: field list;
+      definition:
+        [ `NameOnly of string
+          (** When we only have the name, like when pulling the record from a declared type. *)
+        | `TypeExpr of Types.type_expr
+          (** When we have the full type expr from the compiler. *) ];
+    }
+  | TinlineRecord of {env: QueryEnv.t; fields: field list}
+  | Tfunction of {
+      env: QueryEnv.t;
+      args: typedFnArg list;
+      typ: Types.type_expr;
+      uncurried: bool;
+      returnType: Types.type_expr;
+    }
 
 module Env = struct
-  type t = {stamps: Stamps.t; modulePath: modulePath}
+  type t = {stamps: Stamps.t; modulePath: ModulePath.t}
+  let addExportedModule ~name ~isType env =
+    {
+      env with
+      modulePath = ExportedModule {name; modulePath = env.modulePath; isType};
+    }
+  let addModule ~name env = env |> addExportedModule ~name ~isType:false
+  let addModuleType ~name env = env |> addExportedModule ~name ~isType:true
 end
 
 type filePath = string
@@ -295,6 +399,12 @@ let getUri p =
   | Namespace {cmt} -> Uri.fromPath cmt
   | IntfAndImpl {resi} -> Uri.fromPath resi
 
+let getUris p =
+  match p with
+  | Impl {res} -> [Uri.fromPath res]
+  | Namespace {cmt} -> [Uri.fromPath cmt]
+  | IntfAndImpl {res; resi} -> [Uri.fromPath res; Uri.fromPath resi]
+
 let getCmtPath ~uri p =
   match p with
   | Impl {cmt} -> cmt
@@ -314,10 +424,6 @@ module Tip = struct
     | Constructor a -> "Constructor(" ^ a ^ ")"
     | Module -> "Module"
 end
-
-type path = string list
-
-let pathToString (path : path) = path |> String.concat "."
 
 let rec pathIdentToString (p : Path.t) =
   match p with
@@ -355,15 +461,23 @@ type extra = {
     (string, (string list * Tip.t * Location.t) list) Hashtbl.t;
   fileReferences: (string, LocationSet.t) Hashtbl.t;
   mutable locItems: locItem list;
-  (* This is the "open location", like the location...
-     or maybe the >> location of the open ident maybe *)
-  (* OPTIMIZE: using a stack to come up with this would cut the computation time of this considerably. *)
-  opens: (Location.t, unit) Hashtbl.t;
 }
 
 type file = string
 
 module FileSet = Set.Make (String)
+
+type builtInCompletionModules = {
+  arrayModulePath: string list;
+  optionModulePath: string list;
+  stringModulePath: string list;
+  intModulePath: string list;
+  floatModulePath: string list;
+  promiseModulePath: string list;
+  listModulePath: string list;
+  resultModulePath: string list;
+  exnModulePath: string list;
+}
 
 type package = {
   rootPath: filePath;
@@ -371,8 +485,13 @@ type package = {
   dependenciesFiles: FileSet.t;
   pathsForModule: (file, paths) Hashtbl.t;
   namespace: string option;
-  opens: string list;
+  builtInCompletionModules: builtInCompletionModules;
+  opens: path list;
+  uncurried: bool;
 }
+
+let allFilesInPackage package =
+  FileSet.union package.projectFiles package.dependenciesFiles
 
 type full = {extra: extra; file: File.t; package: package}
 
@@ -382,7 +501,6 @@ let initExtra () =
     externalReferences = Hashtbl.create 10;
     fileReferences = Hashtbl.create 10;
     locItems = [];
-    opens = Hashtbl.create 10;
   }
 
 type state = {
@@ -427,14 +545,69 @@ module Completable = struct
   (* Completion context *)
   type completionContext = Type | Value | Module | Field
 
+  type argumentLabel =
+    | Unlabelled of {argumentPosition: int}
+    | Labelled of string
+    | Optional of string
+
+  (** Additional context for nested completion where needed. *)
+  type nestedContext =
+    | RecordField of {seenFields: string list}
+        (** Completing for a record field, and we already saw the following fields... *)
+    | CameFromRecordField of string
+        (** We just came from this field (we leverage use this for better
+            completion names etc) *)
+
+  type nestedPath =
+    | NTupleItem of {itemNum: int}
+    | NFollowRecordField of {fieldName: string}
+    | NRecordBody of {seenFields: string list}
+    | NVariantPayload of {constructorName: string; itemNum: int}
+    | NPolyvariantPayload of {constructorName: string; itemNum: int}
+    | NArray
+
+  let nestedPathToString p =
+    match p with
+    | NTupleItem {itemNum} -> "tuple($" ^ string_of_int itemNum ^ ")"
+    | NFollowRecordField {fieldName} -> "recordField(" ^ fieldName ^ ")"
+    | NRecordBody _ -> "recordBody"
+    | NVariantPayload {constructorName; itemNum} ->
+      "variantPayload::" ^ constructorName ^ "($" ^ string_of_int itemNum ^ ")"
+    | NPolyvariantPayload {constructorName; itemNum} ->
+      "polyvariantPayload::" ^ constructorName ^ "($" ^ string_of_int itemNum
+      ^ ")"
+    | NArray -> "array"
+
   type contextPath =
     | CPString
-    | CPArray
+    | CPArray of contextPath option
+    | CPInt
+    | CPFloat
+    | CPBool
+    | CPOption of contextPath
     | CPApply of contextPath * Asttypes.arg_label list
     | CPId of string list * completionContext
     | CPField of contextPath * string
     | CPObj of contextPath * string
-    | CPPipe of contextPath * string
+    | CPAwait of contextPath
+    | CPPipe of {
+        contextPath: contextPath;
+        id: string;
+        inJsx: bool;  (** Whether this pipe was found in a JSX context. *)
+        lhsLoc: Location.t;
+            (** The loc item for the left hand side of the pipe. *)
+      }
+    | CTuple of contextPath list
+    | CArgument of {
+        functionContextPath: contextPath;
+        argumentLabel: argumentLabel;
+      }
+    | CJsxPropValue of {pathToComponent: string list; propName: string}
+    | CPatternPath of {rootCtxPath: contextPath; nested: nestedPath list}
+    | CTypeAtPos of Location.t
+        (** A position holding something that might have a *compiled* type. *)
+
+  type patternMode = Default | Destructuring
 
   type t =
     | Cdecorator of string  (** e.g. @module *)
@@ -444,33 +617,78 @@ module Completable = struct
     | Cpath of contextPath
     | Cjsx of string list * string * string list
         (** E.g. (["M", "Comp"], "id", ["id1", "id2"]) for <M.Comp id1=... id2=... ... id *)
+    | Cexpression of {
+        contextPath: contextPath;
+        nested: nestedPath list;
+        prefix: string;
+      }
+    | Cpattern of {
+        contextPath: contextPath;
+        nested: nestedPath list;
+        prefix: string;
+        patternMode: patternMode;
+        fallback: t option;
+      }
+    | CexhaustiveSwitch of {contextPath: contextPath; exprLoc: Location.t}
+    | ChtmlElement of {prefix: string}
 
-  let toString =
-    let completionContextToString = function
-      | Value -> "Value"
-      | Type -> "Type"
-      | Module -> "Module"
-      | Field -> "Field"
-    in
-    let rec contextPathToString = function
-      | CPString -> "string"
-      | CPApply (cp, labels) ->
-        contextPathToString cp ^ "("
-        ^ (labels
-          |> List.map (function
-               | Asttypes.Nolabel -> "Nolabel"
-               | Labelled s -> "~" ^ s
-               | Optional s -> "?" ^ s)
-          |> String.concat ", ")
-        ^ ")"
-      | CPArray -> "array"
-      | CPId (sl, completionContext) ->
-        completionContextToString completionContext ^ list sl
-      | CPField (cp, s) -> contextPathToString cp ^ "." ^ str s
-      | CPObj (cp, s) -> contextPathToString cp ^ "[\"" ^ s ^ "\"]"
-      | CPPipe (cp, s) -> contextPathToString cp ^ "->" ^ s
-    in
-    function
+  let completionContextToString = function
+    | Value -> "Value"
+    | Type -> "Type"
+    | Module -> "Module"
+    | Field -> "Field"
+
+  let rec contextPathToString = function
+    | CPString -> "string"
+    | CPInt -> "int"
+    | CPFloat -> "float"
+    | CPBool -> "bool"
+    | CPAwait ctxPath -> "await " ^ contextPathToString ctxPath
+    | CPOption ctxPath -> "option<" ^ contextPathToString ctxPath ^ ">"
+    | CPApply (cp, labels) ->
+      contextPathToString cp ^ "("
+      ^ (labels
+        |> List.map (function
+             | Asttypes.Nolabel -> "Nolabel"
+             | Labelled s -> "~" ^ s
+             | Optional s -> "?" ^ s)
+        |> String.concat ", ")
+      ^ ")"
+    | CPArray (Some ctxPath) -> "array<" ^ contextPathToString ctxPath ^ ">"
+    | CPArray None -> "array"
+    | CPId (sl, completionContext) ->
+      completionContextToString completionContext ^ list sl
+    | CPField (cp, s) -> contextPathToString cp ^ "." ^ str s
+    | CPObj (cp, s) -> contextPathToString cp ^ "[\"" ^ s ^ "\"]"
+    | CPPipe {contextPath; id; inJsx} ->
+      contextPathToString contextPath
+      ^ "->" ^ id
+      ^ if inJsx then " <<jsx>>" else ""
+    | CTuple ctxPaths ->
+      "CTuple("
+      ^ (ctxPaths |> List.map contextPathToString |> String.concat ", ")
+      ^ ")"
+    | CArgument {functionContextPath; argumentLabel} ->
+      "CArgument "
+      ^ contextPathToString functionContextPath
+      ^ "("
+      ^ (match argumentLabel with
+        | Unlabelled {argumentPosition} -> "$" ^ string_of_int argumentPosition
+        | Labelled name -> "~" ^ name
+        | Optional name -> "~" ^ name ^ "=?")
+      ^ ")"
+    | CJsxPropValue {pathToComponent; propName} ->
+      "CJsxPropValue " ^ (pathToComponent |> list) ^ " " ^ propName
+    | CPatternPath {rootCtxPath; nested} ->
+      "CPatternPath("
+      ^ contextPathToString rootCtxPath
+      ^ ")" ^ "->"
+      ^ (nested
+        |> List.map (fun nestedPath -> nestedPathToString nestedPath)
+        |> String.concat "->")
+    | CTypeAtPos _loc -> "CTypeAtPos()"
+
+  let toString = function
     | Cpath cp -> "Cpath " ^ contextPathToString cp
     | Cdecorator s -> "Cdecorator(" ^ str s ^ ")"
     | CnamedArg (cp, s, sl2) ->
@@ -480,7 +698,113 @@ module Completable = struct
     | Cnone -> "Cnone"
     | Cjsx (sl1, s, sl2) ->
       "Cjsx(" ^ (sl1 |> list) ^ ", " ^ str s ^ ", " ^ (sl2 |> list) ^ ")"
+    | Cpattern {contextPath; nested; prefix} -> (
+      "Cpattern "
+      ^ contextPathToString contextPath
+      ^ (if prefix = "" then "" else "=" ^ prefix)
+      ^
+      match nested with
+      | [] -> ""
+      | nestedPaths ->
+        "->"
+        ^ (nestedPaths
+          |> List.map (fun nestedPath -> nestedPathToString nestedPath)
+          |> String.concat ", "))
+    | Cexpression {contextPath; nested; prefix} -> (
+      "Cexpression "
+      ^ contextPathToString contextPath
+      ^ (if prefix = "" then "" else "=" ^ prefix)
+      ^
+      match nested with
+      | [] -> ""
+      | nestedPaths ->
+        "->"
+        ^ (nestedPaths
+          |> List.map (fun nestedPath -> nestedPathToString nestedPath)
+          |> String.concat ", "))
+    | CexhaustiveSwitch {contextPath} ->
+      "CexhaustiveSwitch " ^ contextPathToString contextPath
+    | ChtmlElement {prefix} -> "ChtmlElement <" ^ prefix
 end
+
+module Completion = struct
+  type kind =
+    | Module of Module.t
+    | Value of Types.type_expr
+    | ObjLabel of Types.type_expr
+    | Label of string
+    | Type of Type.t
+    | Constructor of Constructor.t * string
+    | PolyvariantConstructor of polyVariantConstructor * string
+    | Field of field * string
+    | FileModule of string
+    | Snippet of string
+    | ExtractedType of completionType * [`Value | `Type]
+    | FollowContextPath of Completable.contextPath
+
+  type t = {
+    name: string;
+    sortText: string option;
+    insertText: string option;
+    filterText: string option;
+    insertTextFormat: Protocol.insertTextFormat option;
+    env: QueryEnv.t;
+    deprecated: string option;
+    docstring: string list;
+    kind: kind;
+    detail: string option;
+  }
+
+  let create ~kind ~env ?(docstring = []) ?filterText ?detail ?deprecated
+      ?insertText name =
+    {
+      name;
+      env;
+      deprecated;
+      docstring;
+      kind;
+      sortText = None;
+      insertText;
+      insertTextFormat = None;
+      filterText;
+      detail;
+    }
+
+  let createWithSnippet ~name ?insertText ~kind ~env ?sortText ?deprecated
+      ?filterText ?detail ?(docstring = []) () =
+    {
+      name;
+      env;
+      deprecated;
+      docstring;
+      kind;
+      sortText;
+      insertText;
+      insertTextFormat = Some Protocol.Snippet;
+      filterText;
+      detail;
+    }
+
+  (* https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textDocument_completion *)
+  (* https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind *)
+  let kindToInt kind =
+    match kind with
+    | Module _ -> 9
+    | FileModule _ -> 9
+    | Constructor (_, _) | PolyvariantConstructor (_, _) -> 4
+    | ObjLabel _ -> 4
+    | Label _ -> 4
+    | Field (_, _) -> 5
+    | Type _ | ExtractedType (_, `Type) -> 22
+    | Value _ | ExtractedType (_, `Value) -> 12
+    | Snippet _ | FollowContextPath _ -> 15
+end
+
+let kindFromInnerType (t : innerType) =
+  match t with
+  | ExtractedType extractedType ->
+    Completion.ExtractedType (extractedType, `Value)
+  | TypeExpr typ -> Value typ
 
 module CursorPosition = struct
   type t = NoCursor | HasCursor | EmptyLoc
@@ -500,6 +824,10 @@ module CursorPosition = struct
     if posStart <= pos && pos <= posEnd then HasCursor
     else if posEnd = (Location.none |> Loc.end_) then EmptyLoc
     else NoCursor
+
+  let locHasCursor loc ~pos = loc |> classifyLoc ~pos = HasCursor
+
+  let locIsEmpty loc ~pos = loc |> classifyLoc ~pos = EmptyLoc
 end
 
 type labelled = {
@@ -519,7 +847,7 @@ let extractExpApplyArgs ~args =
       :: rest -> (
       let namedArgLoc =
         e.pexp_attributes
-        |> List.find_opt (fun ({Asttypes.txt}, _) -> txt = "ns.namedArgLoc")
+        |> List.find_opt (fun ({Asttypes.txt}, _) -> txt = "res.namedArgLoc")
       in
       match namedArgLoc with
       | Some ({loc}, _) ->

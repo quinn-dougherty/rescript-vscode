@@ -210,3 +210,56 @@ let usr: useR = {
 
 // let f = usr
 //           ^hov
+
+
+module NotShadowed = {
+  /** Stuff */
+  let xx_ = 10
+
+  /** More Stuff */
+  let xx = xx_
+}
+
+module Shadowed = {
+  /** Stuff */
+  let xx = 10
+
+  /** More Stuff */
+  let xx = xx
+}
+
+let _ = NotShadowed.xx
+//                  ^hov
+
+let _ = Shadowed.xx
+//               ^hov
+
+type recordWithDocstringField = {
+  /** Mighty fine field here. */
+  someField: bool,
+}
+
+let x: recordWithDocstringField = {
+  someField: true,
+}
+
+// x.someField
+//    ^hov
+
+let someField = x.someField
+//                 ^hov
+
+type variant = | /** Cool variant! */ CoolVariant | /** Other cool variant */ OtherCoolVariant
+
+let coolVariant = CoolVariant
+//                  ^hov
+
+// Hover on unsaved
+// let fff = "hello"; fff
+//                     ^hov
+
+// switch x { | {someField} => someField }
+//                               ^hov
+
+module Arr = Belt.Array
+//      ^hov

@@ -164,11 +164,13 @@ let printSignature ~extractor ~signature =
 
   let buf = Buffer.create 10 in
 
-  let getComponentTypeV3 (typ : Types.type_expr) =
+  let rec getComponentTypeV3 (typ : Types.type_expr) =
     let reactElement =
       Ctype.newconstr (Pdot (Pident (Ident.create "React"), "element", 0)) []
     in
     match typ.desc with
+    | Tconstr (Pident {name = "function$"}, [typ; _], _) ->
+      getComponentTypeV3 typ
     | Tarrow (_, {desc = Tobject (tObj, _)}, retType, _) -> Some (tObj, retType)
     | Tconstr
         ( Pdot (Pident {name = "React"}, "component", _),
@@ -183,11 +185,13 @@ let printSignature ~extractor ~signature =
     | _ -> None
   in
 
-  let getComponentTypeV4 (typ : Types.type_expr) =
+  let rec getComponentTypeV4 (typ : Types.type_expr) =
     let reactElement =
       Ctype.newconstr (Pdot (Pident (Ident.create "React"), "element", 0)) []
     in
     match typ.desc with
+    | Tconstr (Pident {name = "function$"}, [typ; _], _) ->
+      getComponentTypeV4 typ
     | Tarrow (_, {desc = Tconstr (Path.Pident propsId, typeArgs, _)}, retType, _)
       when Ident.name propsId = "props" ->
       Some (typeArgs, retType)
@@ -240,16 +244,15 @@ let printSignature ~extractor ~signature =
         ( propsId,
           {
             type_params;
-            type_kind = Type_record (labelDecls, Record_optional_labels optLbls);
+            type_kind = Type_record (labelDecls, recordRepresentation);
           },
           _ )
       :: Sig_value (makeId (* make *), makeValueDesc)
       :: rest
       when Ident.name propsId = "props"
-           && getComponentTypeV4 makeValueDesc.val_type <> None
-           && optLbls |> List.mem "key" ->
+           && getComponentTypeV4 makeValueDesc.val_type <> None ->
       (* PPX V4 component declaration:
-         type props = {..., key?: _}
+         type props = {...}
          let v = ...
       *)
       let newItemStr =
@@ -263,20 +266,23 @@ let printSignature ~extractor ~signature =
           | [] -> retType
           | labelDecl :: rest ->
             let propType =
-              CompletionBackEnd.instantiateType ~typeParams:type_params
-                ~typeArgs labelDecl.ld_type
+              TypeUtils.instantiateType ~typeParams:type_params ~typeArgs
+                labelDecl.ld_type
             in
             let lblName = labelDecl.ld_id |> Ident.name in
             let lbl =
+              let optLbls =
+                match recordRepresentation with
+                | Record_optional_labels optLbls -> optLbls
+                | _ -> []
+              in
               if List.mem lblName optLbls then Asttypes.Optional lblName
               else Labelled lblName
             in
-            if lblName = "key" then mkFunType rest
-            else
-              {retType with desc = Tarrow (lbl, propType, mkFunType rest, Cok)}
+            {retType with desc = Tarrow (lbl, propType, mkFunType rest, Cok)}
         in
         let funType =
-          if List.length labelDecls = 1 (* No props: only "key "*) then
+          if List.length labelDecls = 0 (* No props *) then
             let tUnit =
               Ctype.newconstr (Path.Pident (Ident.create "unit")) []
             in
@@ -408,6 +414,8 @@ let printSignature ~extractor ~signature =
 let command ~path ~cmiFile =
   match Shared.tryReadCmi cmiFile with
   | Some cmi_info ->
+    (* For reading the config *)
+    let _ = Cmt.loadFullCmtFromPath ~path in
     let extractor = SourceFileExtractor.create ~path in
     printSignature ~extractor ~signature:cmi_info.cmi_sign
   | None -> ""

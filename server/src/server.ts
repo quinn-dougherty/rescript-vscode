@@ -37,7 +37,7 @@ interface extensionConfiguration {
   binaryPath: string | null;
   platformPath: string | null;
   signatureHelp: {
-    enable: boolean;
+    enabled: boolean;
   };
 }
 
@@ -46,6 +46,7 @@ interface extensionConfiguration {
 // work in one client, like VSCode, but perhaps not in others, like vim.
 export interface extensionClientCapabilities {
   supportsMarkdownLinks?: boolean | null;
+  supportsSnippetSyntax?: boolean | null;
 }
 let extensionClientCapabilities: extensionClientCapabilities = {};
 
@@ -62,7 +63,7 @@ let extensionConfiguration: extensionConfiguration = {
   binaryPath: null,
   platformPath: null,
   signatureHelp: {
-    enable: false,
+    enabled: true,
   },
 };
 // Below here is some state that's not important exactly how long it lives.
@@ -139,25 +140,17 @@ let findPlatformPath = (projectRootPath: p.DocumentUri | null) => {
 let findBscExeBinary = (projectRootPath: p.DocumentUri | null) =>
   utils.findBinary(findPlatformPath(projectRootPath), c.bscExeName);
 
-interface CreateInterfaceRequestParams {
-  uri: string;
-}
-
 let createInterfaceRequest = new v.RequestType<
-  CreateInterfaceRequestParams,
-  string,
+  p.TextDocumentIdentifier,
+  p.TextDocumentIdentifier,
   void
->("rescript-vscode.create_interface");
-
-interface OpenCompiledFileParams {
-  uri: string;
-}
+>("textDocument/createInterface");
 
 let openCompiledFileRequest = new v.RequestType<
-  OpenCompiledFileParams,
-  OpenCompiledFileParams,
+  p.TextDocumentIdentifier,
+  p.TextDocumentIdentifier,
   void
->("rescript-vscode.open_compiled");
+>("textDocument/openCompiled");
 
 let getCurrentCompilerDiagnosticsForFile = (
   fileUri: string
@@ -407,20 +400,22 @@ let getOpenedFileContent = (fileUri: string) => {
   return content;
 };
 
-// Start listening now!
-// We support two modes: the regular node RPC mode for VSCode, and the --stdio
-// mode for other editors The latter is _technically unsupported_. It's an
-// implementation detail that might change at any time
-if (process.argv.includes("--stdio")) {
-  let writer = new rpc.StreamMessageWriter(process.stdout);
-  let reader = new rpc.StreamMessageReader(process.stdin);
-  // proper `this` scope for writer
-  send = (msg: p.Message) => writer.write(msg);
-  reader.listen(onMessage);
-} else {
-  // proper `this` scope for process
-  send = (msg: p.Message) => process.send!(msg);
-  process.on("message", onMessage);
+export default function listen(useStdio = false) {
+  // Start listening now!
+  // We support two modes: the regular node RPC mode for VSCode, and the --stdio
+  // mode for other editors The latter is _technically unsupported_. It's an
+  // implementation detail that might change at any time
+  if (useStdio) {
+    let writer = new rpc.StreamMessageWriter(process.stdout);
+    let reader = new rpc.StreamMessageReader(process.stdin);
+    // proper `this` scope for writer
+    send = (msg: p.Message) => writer.write(msg);
+    reader.listen(onMessage);
+  } else {
+    // proper `this` scope for process
+    send = (msg: p.Message) => process.send!(msg);
+    process.on("message", onMessage);
+  }
 }
 
 function hover(msg: p.RequestMessage) {
@@ -688,6 +683,7 @@ function completion(msg: p.RequestMessage) {
       params.position.line,
       params.position.character,
       tmpname,
+      Boolean(extensionClientCapabilities.supportsSnippetSyntax),
     ],
     msg
   );
@@ -720,6 +716,8 @@ function codeAction(msg: p.RequestMessage): p.ResponseMessage {
       filePath,
       params.range.start.line,
       params.range.start.character,
+      params.range.end.line,
+      params.range.end.character,
       tmpname,
     ],
     msg
@@ -859,7 +857,7 @@ let updateDiagnosticSyntax = (fileUri: string, fileContent: string) => {
 };
 
 function createInterface(msg: p.RequestMessage): p.Message {
-  let params = msg.params as CreateInterfaceRequestParams;
+  let params = msg.params as p.TextDocumentIdentifier;
   let extension = path.extname(params.uri);
   let filePath = fileURLToPath(params.uri);
   let projDir = utils.findProjectRootOfFile(filePath);
@@ -897,12 +895,12 @@ function createInterface(msg: p.RequestMessage): p.Message {
   let resPartialPath = filePath.split(projDir)[1];
 
   // The .cmi filename may have a namespace suffix appended.
-  let namespaceResult = utils.getNamespaceNameFromBsConfig(projDir);
+  let namespaceResult = utils.getNamespaceNameFromConfigFile(projDir);
 
   if (namespaceResult.kind === "error") {
     let params: p.ShowMessageParams = {
       type: p.MessageType.Error,
-      message: `Error reading bsconfig file.`,
+      message: `Error reading ReScript config file.`,
     };
 
     let response: p.NotificationMessage = {
@@ -953,7 +951,9 @@ function createInterface(msg: p.RequestMessage): p.Message {
     let response: p.ResponseMessage = {
       jsonrpc: c.jsonrpcVersion,
       id: msg.id,
-      result: "Interface successfully created.",
+      result: {
+        uri: utils.pathToURI(resiPath),
+      },
     };
     return response;
   } catch (e) {
@@ -970,7 +970,7 @@ function createInterface(msg: p.RequestMessage): p.Message {
 }
 
 function openCompiledFile(msg: p.RequestMessage): p.Message {
-  let params = msg.params as OpenCompiledFileParams;
+  let params = msg.params as p.TextDocumentIdentifier;
   let filePath = fileURLToPath(params.uri);
   let projDir = utils.findProjectRootOfFile(filePath);
 
@@ -1014,14 +1014,12 @@ function openCompiledFile(msg: p.RequestMessage): p.Message {
     return response;
   }
 
-  let result: OpenCompiledFileParams = {
-    uri: compiledFilePath.result,
-  };
-
   let response: p.ResponseMessage = {
     jsonrpc: c.jsonrpcVersion,
     id: msg.id,
-    result,
+    result: {
+      uri: utils.pathToURI(compiledFilePath.result),
+    },
   };
 
   return response;
@@ -1103,6 +1101,11 @@ function onMessage(msg: p.Message) {
         extensionClientCapabilities = extensionClientCapabilitiesFromClient;
       }
 
+      extensionClientCapabilities.supportsSnippetSyntax = Boolean(
+        initParams.capabilities.textDocument?.completion?.completionItem
+          ?.snippetSupport
+      );
+
       // send the list of features we support
       let result: p.InitializeResult = {
         // This tells the client: "hey, we support the following operations".
@@ -1119,22 +1122,24 @@ function onMessage(msg: p.Message) {
           codeActionProvider: true,
           renameProvider: { prepareProvider: true },
           documentSymbolProvider: true,
-          completionProvider: { triggerCharacters: [".", ">", "@", "~", '"'] },
+          completionProvider: {
+            triggerCharacters: [".", ">", "@", "~", '"', "=", "("],
+          },
           semanticTokensProvider: {
             legend: {
               tokenTypes: [
                 "operator",
                 "variable",
-                "support-type-primitive",
-                "jsx-tag",
-                "class",
+                "type",
+                "modifier", // emit jsx-tag < and > in <div> as modifier
+                "namespace",
                 "enumMember",
                 "property",
-                "jsx-lowercase",
+                "interface", // emit jsxlowercase, div in <div> as interface
               ],
               tokenModifiers: [],
             },
-            documentSelector: null,
+            documentSelector: [{ scheme: "file", language: "rescript" }],
             // TODO: Support range for full, and add delta support
             full: true,
           },
@@ -1144,7 +1149,7 @@ function onMessage(msg: p.Message) {
                 workDoneProgress: false,
               }
             : undefined,
-          signatureHelpProvider: extensionConfiguration.signatureHelp?.enable
+          signatureHelpProvider: extensionConfiguration.signatureHelp?.enabled
             ? {
                 triggerCharacters: ["("],
                 retriggerCharacters: ["=", ","],

@@ -1,7 +1,8 @@
 open Common
-module StringMap = Ext_json_types.StringMap
+module StringMap = Map_string
 
 let bsconfig = "bsconfig.json"
+let rescriptJson = "rescript.json"
 
 let readFile filename =
   try
@@ -13,13 +14,14 @@ let readFile filename =
   with _ -> None
 
 let rec findProjectRoot ~dir =
+  let rescriptJsonFile = Filename.concat dir rescriptJson in
   let bsconfigFile = Filename.concat dir bsconfig in
-  if Sys.file_exists bsconfigFile then dir
+  if Sys.file_exists rescriptJsonFile || Sys.file_exists bsconfigFile then dir
   else
     let parent = dir |> Filename.dirname in
     if parent = dir then (
       prerr_endline
-        ("Error: cannot find project root containing " ^ bsconfig ^ ".");
+        ("Error: cannot find project root containing " ^ rescriptJson ^ ".");
       assert false)
     else findProjectRoot ~dir:parent
 
@@ -73,13 +75,19 @@ module Config = struct
       (* if no "analysis" specified, default to dce *)
       RunConfig.dce ()
 
-  (* Read the config from bsconfig.json and apply it to runConfig and suppress and unsuppress *)
+  let readTransitive conf =
+    match Json.get "transitive" conf with
+    | Some True -> RunConfig.transitive true
+    | Some False -> RunConfig.transitive false
+    | _ -> ()
+
+  (* Read the config from rescript.json/bsconfig.json and apply it to runConfig and suppress and unsuppress *)
   let processBsconfig () =
     Lazy.force setReScriptProjectRoot;
+    let rescriptFile = Filename.concat runConfig.projectRoot rescriptJson in
     let bsconfigFile = Filename.concat runConfig.projectRoot bsconfig in
-    match readFile bsconfigFile with
-    | None -> ()
-    | Some text -> (
+
+    let processText text =
       match Json.parse text with
       | None -> ()
       | Some json -> (
@@ -87,10 +95,19 @@ module Config = struct
         | Some conf ->
           readSuppress conf;
           readUnsuppress conf;
-          readAnalysis conf
+          readAnalysis conf;
+          readTransitive conf
         | None ->
           (* if no "analysis" specified, default to dce *)
-          RunConfig.dce ()))
+          RunConfig.dce ())
+    in
+
+    match readFile rescriptFile with
+    | Some text -> processText text
+    | None -> (
+      match readFile bsconfigFile with
+      | Some text -> processText text
+      | None -> ())
 end
 
 (**
@@ -131,19 +148,19 @@ let readDirsFromConfig ~configSources =
   in
   let rec processSourceItem (sourceItem : Ext_json_types.t) =
     match sourceItem with
-    | Str str -> str |> processDir ~subdirs:false
-    | Obj map -> (
-      match map |> StringMap.find_opt "dir" with
-      | Some (Str str) ->
+    | Str {str} -> str |> processDir ~subdirs:false
+    | Obj {map} -> (
+      match StringMap.find_opt map "dir" with
+      | Some (Str {str}) ->
         let subdirs =
-          match map |> StringMap.find_opt "subdirs" with
+          match StringMap.find_opt map "subdirs" with
           | Some (True _) -> true
           | Some (False _) -> false
           | _ -> false
         in
         str |> processDir ~subdirs
       | _ -> ())
-    | Arr arr -> arr |> Array.iter processSourceItem
+    | Arr {content = arr} -> arr |> Array.iter processSourceItem
     | _ -> ()
   in
   (match configSources with
@@ -159,13 +176,13 @@ let readSourceDirs ~configSources =
   let dirs = ref [] in
   let readDirs json =
     match json with
-    | Ext_json_types.Obj map -> (
-      match map |> StringMap.find_opt "dirs" with
-      | Some (Arr arr) ->
+    | Ext_json_types.Obj {map} -> (
+      match StringMap.find_opt map "dirs" with
+      | Some (Arr {content = arr}) ->
         arr
         |> Array.iter (fun x ->
                match x with
-               | Ext_json_types.Str str -> dirs := str :: !dirs
+               | Ext_json_types.Str {str} -> dirs := str :: !dirs
                | _ -> ());
         ()
       | _ -> ())
@@ -174,12 +191,12 @@ let readSourceDirs ~configSources =
   if sourceDirs |> Sys.file_exists then
     let jsonOpt = sourceDirs |> Ext_json_parse.parse_json_from_file in
     match jsonOpt with
-    | Some json ->
+    | exception _ -> ()
+    | json ->
       if runConfig.bsbProjectRoot <> runConfig.projectRoot then (
         readDirs json;
         dirs := readDirsFromConfig ~configSources)
       else readDirs json
-    | None -> ()
   else (
     if !Cli.debug then (
       Log_.item "Warning: can't find source dirs: %s\n" sourceDirs;

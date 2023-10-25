@@ -3,7 +3,7 @@ let help =
 **Private CLI For rescript-vscode usage only**
 
 API examples:
-  ./rescript-editor-analysis.exe completion src/MyFile.res 0 4 currentContent.res
+  ./rescript-editor-analysis.exe completion src/MyFile.res 0 4 currentContent.res true
   ./rescript-editor-analysis.exe definition src/MyFile.res 9 3
   ./rescript-editor-analysis.exe typeDefinition src/MyFile.res 9 3
   ./rescript-editor-analysis.exe documentSymbol src/Foo.res
@@ -86,7 +86,11 @@ Options:
 
 let main () =
   match Array.to_list Sys.argv with
-  | [_; "completion"; path; line; col; currentFile] ->
+  | [_; "completion"; path; line; col; currentFile; supportsSnippets] ->
+    (Cfg.supportsSnippets :=
+       match supportsSnippets with
+       | "true" -> true
+       | _ -> false);
     Commands.completion ~debug:false ~path
       ~pos:(int_of_string line, int_of_string col)
       ~currentFile
@@ -116,10 +120,26 @@ let main () =
       ~pos:(int_of_string line_start, int_of_string line_end)
       ~maxLength ~debug:false
   | [_; "codeLens"; path] -> Commands.codeLens ~path ~debug:false
-  | [_; "codeAction"; path; line; col; currentFile] ->
+  | [_; "extractDocs"; path] -> DocExtraction.extractDocs ~path ~debug:false
+  | [_; "codeAction"; path; startLine; startCol; endLine; endCol; currentFile]
+    ->
     Commands.codeAction ~path
-      ~pos:(int_of_string line, int_of_string col)
+      ~startPos:(int_of_string startLine, int_of_string startCol)
+      ~endPos:(int_of_string endLine, int_of_string endCol)
       ~currentFile ~debug:false
+  | [_; "codemod"; path; line; col; typ; hint] ->
+    let typ =
+      match typ with
+      | "add-missing-cases" -> Codemod.AddMissingCases
+      | _ -> raise (Failure "unsupported type")
+    in
+    let res =
+      Codemod.transform ~path
+        ~pos:(int_of_string line, int_of_string col)
+        ~debug:false ~typ ~hint
+      |> Json.escape
+    in
+    Printf.printf "\"%s\"" res
   | [_; "diagnosticSyntax"; path] -> Commands.diagnosticSyntax ~path
   | _ :: "reanalyze" :: _ ->
     let len = Array.length Sys.argv in
@@ -143,7 +163,9 @@ let main () =
       (Json.escape (CreateInterface.command ~path ~cmiFile))
   | [_; "format"; path] ->
     Printf.printf "\"%s\"" (Json.escape (Commands.format ~path))
-  | [_; "test"; path] -> Commands.test ~path
+  | [_; "test"; path] ->
+    Cfg.supportsSnippets := true;
+    Commands.test ~path
   | args when List.mem "-h" args || List.mem "--help" args -> prerr_endline help
   | _ ->
     prerr_endline help;

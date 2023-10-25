@@ -1,6 +1,6 @@
 open SharedTypes
 
-let showModuleTopLevel ~docstring ~name (topLevel : Module.item list) =
+let showModuleTopLevel ~docstring ~isType ~name (topLevel : Module.item list) =
   let contents =
     topLevel
     |> List.map (fun item ->
@@ -15,7 +15,10 @@ let showModuleTopLevel ~docstring ~name (topLevel : Module.item list) =
     |> String.concat "\n"
   in
   let full =
-    Markdown.codeBlock ("module " ^ name ^ " = {" ^ "\n" ^ contents ^ "\n}")
+    Markdown.codeBlock
+      ("module "
+      ^ (if isType then "type " ^ name ^ " = " else name ^ ": ")
+      ^ "{" ^ "\n" ^ contents ^ "\n}")
   in
   let doc =
     match docstring with
@@ -24,17 +27,26 @@ let showModuleTopLevel ~docstring ~name (topLevel : Module.item list) =
   in
   Some (doc ^ full)
 
-let rec showModule ~docstring ~(file : File.t) ~name
+let rec showModule ~docstring ~(file : File.t) ~package ~name
     (declared : Module.t Declared.t option) =
   match declared with
-  | None -> showModuleTopLevel ~docstring ~name file.structure.items
-  | Some {item = Structure {items}} -> showModuleTopLevel ~docstring ~name items
+  | None ->
+    showModuleTopLevel ~docstring ~isType:false ~name file.structure.items
+  | Some {item = Structure {items}; modulePath} ->
+    let isType =
+      match modulePath with
+      | ExportedModule {isType} -> isType
+      | _ -> false
+    in
+    showModuleTopLevel ~docstring ~isType ~name items
   | Some ({item = Constraint (_moduleItem, moduleTypeItem)} as declared) ->
     (* show the interface *)
-    showModule ~docstring ~file ~name
+    showModule ~docstring ~file ~name ~package
       (Some {declared with item = moduleTypeItem})
-  | Some {item = Ident path} ->
-    Some ("Unable to resolve module reference " ^ Path.name path)
+  | Some ({item = Ident path} as declared) -> (
+    match References.resolveModuleReference ~file ~package declared with
+    | None -> Some ("Unable to resolve module reference " ^ Path.name path)
+    | Some (_, declared) -> showModule ~docstring ~file ~name ~package declared)
 
 type extractedType = {
   name: string;
@@ -88,8 +100,7 @@ let findRelevantTypesFromType ~file ~package typ =
   constructors |> List.filter_map (fromConstructorPath ~env:envToSearch)
 
 (* Produces a hover with relevant types expanded in the main type being hovered. *)
-let hoverWithExpandedTypes ~docstring ~file ~package ~supportsMarkdownLinks typ
-    =
+let hoverWithExpandedTypes ~file ~package ~supportsMarkdownLinks typ =
   let typeString = Markdown.codeBlock (typ |> Shared.typeToString) in
   let types = findRelevantTypesFromType typ ~file ~package in
   let typeDefinitions =
@@ -100,58 +111,57 @@ let hoverWithExpandedTypes ~docstring ~file ~package ~supportsMarkdownLinks typ
                Markdown.goToDefinitionText ~env ~pos:loc.Warnings.loc_start
              else ""
            in
-           "\n" ^ Markdown.spacing
+           Markdown.divider
+           ^ (if supportsMarkdownLinks then Markdown.spacing else "")
            ^ Markdown.codeBlock
                (decl
                |> Shared.declToString ~printNameAsIs:true
                     (SharedTypes.pathIdentToString path))
-           ^ linkToTypeDefinitionStr ^ "\n" ^ Markdown.divider)
+           ^ linkToTypeDefinitionStr ^ "\n")
   in
-  (typeString :: typeDefinitions |> String.concat "\n", docstring)
+  typeString :: typeDefinitions |> String.concat "\n"
 
 (* Leverages autocomplete functionality to produce a hover for a position. This
    makes it (most often) work with unsaved content. *)
 let getHoverViaCompletions ~debug ~path ~pos ~currentFile ~forHover
     ~supportsMarkdownLinks =
-  let textOpt = Files.readFile currentFile in
-  match textOpt with
-  | None | Some "" -> None
-  | Some text -> (
-    match
-      CompletionFrontEnd.completionWithParser ~debug ~path ~posCursor:pos
-        ~currentFile ~text
-    with
-    | None -> None
-    | Some (completable, scope) -> (
-      if debug then
-        Printf.printf "Completable: %s\n"
-          (SharedTypes.Completable.toString completable);
-      (* Only perform expensive ast operations if there are completables *)
-      match Cmt.fullFromPath ~path with
-      | None -> None
-      | Some {file; package} -> (
-        let env = SharedTypes.QueryEnv.fromFile file in
-        let completions =
-          completable
-          |> CompletionBackEnd.processCompletable ~debug ~package ~pos ~scope
-               ~env ~forHover
+  match Completions.getCompletions ~debug ~path ~pos ~currentFile ~forHover with
+  | None -> None
+  | Some (completions, ({file; package} as full), scope) -> (
+    let rawOpens = Scope.getRawOpens scope in
+    match completions with
+    | {kind = Label typString; docstring} :: _ ->
+      let parts =
+        (if typString = "" then [] else [Markdown.codeBlock typString])
+        @ docstring
+      in
+      Some (Protocol.stringifyHover (String.concat "\n\n" parts))
+    | {kind = Field _; env; docstring} :: _ -> (
+      let opens = CompletionBackEnd.getOpens ~debug ~rawOpens ~package ~env in
+      match
+        CompletionBackEnd.completionsGetTypeEnv2 ~debug ~full ~rawOpens ~opens
+          ~pos ~scope completions
+      with
+      | Some (typ, _env) ->
+        let typeString =
+          hoverWithExpandedTypes ~file ~package ~supportsMarkdownLinks typ
         in
-        match completions with
-        | {kind = Label typString; docstring} :: _ ->
-          let parts =
-            (if typString = "" then [] else [Markdown.codeBlock typString])
-            @ docstring
-          in
-          Some (Protocol.stringifyHover (String.concat "\n\n" parts))
-        | _ -> (
-          match CompletionBackEnd.completionsGetTypeEnv completions with
-          | Some (typ, _env) ->
-            let typeString, _docstring =
-              hoverWithExpandedTypes ~docstring:"" ~file ~package
-                ~supportsMarkdownLinks typ
-            in
-            Some (Protocol.stringifyHover typeString)
-          | None -> None))))
+        let parts = typeString :: docstring in
+        Some (Protocol.stringifyHover (String.concat "\n\n" parts))
+      | None -> None)
+    | {env} :: _ -> (
+      let opens = CompletionBackEnd.getOpens ~debug ~rawOpens ~package ~env in
+      match
+        CompletionBackEnd.completionsGetTypeEnv2 ~debug ~full ~rawOpens ~opens
+          ~pos ~scope completions
+      with
+      | Some (typ, _env) ->
+        let typeString =
+          hoverWithExpandedTypes ~file ~package ~supportsMarkdownLinks typ
+        in
+        Some (Protocol.stringifyHover typeString)
+      | None -> None)
+    | _ -> None)
 
 let newHover ~full:{file; package} ~supportsMarkdownLinks locItem =
   match locItem.locType with
@@ -171,37 +181,34 @@ let newHover ~full:{file; package} ~supportsMarkdownLinks locItem =
           | Some d -> (d.name.txt, d.docstring)
           | None -> (file.moduleName, file.structure.docstring)
         in
-        showModule ~docstring ~name ~file declared))
+        showModule ~docstring ~name ~file declared ~package))
   | LModule (GlobalReference (moduleName, path, tip)) -> (
     match ProcessCmt.fileForModule ~package moduleName with
     | None -> None
     | Some file -> (
       let env = QueryEnv.fromFile file in
-      match ResolvePath.resolvePath ~env ~path ~package with
+      match References.exportedForTip ~env ~path ~package ~tip with
       | None -> None
-      | Some (env, name) -> (
-        match References.exportedForTip ~env name tip with
+      | Some (_env, _name, stamp) -> (
+        match Stamps.findModule file.stamps stamp with
         | None -> None
-        | Some stamp -> (
-          match Stamps.findModule file.stamps stamp with
+        | Some md -> (
+          match References.resolveModuleReference ~file ~package md with
           | None -> None
-          | Some md -> (
-            match References.resolveModuleReference ~file ~package md with
-            | None -> None
-            | Some (file, declared) ->
-              let name, docstring =
-                match declared with
-                | Some d -> (d.name.txt, d.docstring)
-                | None -> (file.moduleName, file.structure.docstring)
-              in
-              showModule ~docstring ~name ~file declared)))))
+          | Some (file, declared) ->
+            let name, docstring =
+              match declared with
+              | Some d -> (d.name.txt, d.docstring)
+              | None -> (file.moduleName, file.structure.docstring)
+            in
+            showModule ~docstring ~name ~file ~package declared))))
   | LModule NotFound -> None
   | TopLevelModule name -> (
     match ProcessCmt.fileForModule ~package name with
     | None -> None
     | Some file ->
       showModule ~docstring:file.structure.docstring ~name:file.moduleName ~file
-        None)
+        ~package None)
   | Typed (_, _, Definition (_, (Field _ | Constructor _))) -> None
   | Constant t ->
     Some
@@ -216,8 +223,8 @@ let newHover ~full:{file; package} ~supportsMarkdownLinks locItem =
          | Const_nativeint _ -> "int"))
   | Typed (_, t, locKind) ->
     let fromType ~docstring typ =
-      hoverWithExpandedTypes ~docstring ~file ~package ~supportsMarkdownLinks
-        typ
+      ( hoverWithExpandedTypes ~file ~package ~supportsMarkdownLinks typ,
+        docstring )
     in
     let parts =
       match References.definedForLoc ~file ~package locKind with
@@ -229,17 +236,17 @@ let newHover ~full:{file; package} ~supportsMarkdownLinks locItem =
         | `Declared ->
           let typeString, docstring = t |> fromType ~docstring in
           typeString :: docstring
-        | `Constructor {cname = {txt}; args} ->
+        | `Constructor {cname = {txt}; args; docstring} ->
           let typeString, docstring = t |> fromType ~docstring in
           let argsString =
             match args with
-            | [] -> ""
-            | _ ->
+            | InlineRecord _ | Args [] -> ""
+            | Args args ->
               args
               |> List.map (fun (t, _) -> Shared.typeToString t)
               |> String.concat ", " |> Printf.sprintf "(%s)"
           in
-          typeString :: Markdown.codeBlock (txt ^ argsString) :: docstring
+          (Markdown.codeBlock (txt ^ argsString) :: docstring) @ [typeString]
         | `Field ->
           let typeString, docstring = t |> fromType ~docstring in
           typeString :: docstring)

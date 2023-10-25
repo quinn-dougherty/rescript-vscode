@@ -33,16 +33,32 @@ type signatureHelp = {
   activeParameter: int option;
 }
 
+(* https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#insertTextFormat *)
+type insertTextFormat = Snippet
+
+let insertTextFormatToInt f =
+  match f with
+  | Snippet -> 2
+
 type completionItem = {
   label: string;
   kind: int;
   tags: int list;
   detail: string;
+  sortText: string option;
+  filterText: string option;
+  insertTextFormat: insertTextFormat option;
+  insertText: string option;
   documentation: markupContent option;
 }
 
 type location = {uri: string; range: range}
-type documentSymbolItem = {name: string; kind: int; location: location}
+type documentSymbolItem = {
+  name: string;
+  kind: int;
+  range: range;
+  children: documentSymbolItem list;
+}
 type renameFile = {oldUri: string; newUri: string}
 type textEdit = {range: range; newText: string}
 
@@ -81,37 +97,98 @@ let stringifyRange r =
 let stringifyMarkupContent (m : markupContent) =
   Printf.sprintf {|{"kind": "%s", "value": "%s"}|} m.kind (Json.escape m.value)
 
-let stringifyCompletionItem c =
-  Printf.sprintf
-    {|{
-    "label": "%s",
-    "kind": %i,
-    "tags": %s,
-    "detail": "%s",
-    "documentation": %s
-  }|}
-    (Json.escape c.label) c.kind
-    (c.tags |> List.map string_of_int |> array)
-    (Json.escape c.detail)
-    (match c.documentation with
-    | None -> null
-    | Some doc -> stringifyMarkupContent doc)
+(** None values are not emitted in the output. *)
+let stringifyObject ?(startOnNewline = false) ?(indentation = 1) properties =
+  let indentationStr = String.make (indentation * 2) ' ' in
+  (if startOnNewline then "\n" ^ indentationStr else "")
+  ^ {|{
+|}
+  ^ (properties
+    |> List.filter_map (fun (key, value) ->
+           match value with
+           | None -> None
+           | Some v ->
+             Some (Printf.sprintf {|%s  "%s": %s|} indentationStr key v))
+    |> String.concat ",\n")
+  ^ "\n" ^ indentationStr ^ "}"
 
-let stringifyHover s = Printf.sprintf {|{"contents": "%s"}|} (Json.escape s)
+let wrapInQuotes s = "\"" ^ Json.escape s ^ "\""
+
+let optWrapInQuotes s =
+  match s with
+  | None -> None
+  | Some s -> Some (wrapInQuotes s)
+
+let stringifyCompletionItem c =
+  stringifyObject
+    [
+      ("label", Some (wrapInQuotes c.label));
+      ("kind", Some (string_of_int c.kind));
+      ("tags", Some (c.tags |> List.map string_of_int |> array));
+      ("detail", Some (wrapInQuotes c.detail));
+      ( "documentation",
+        Some
+          (match c.documentation with
+          | None -> null
+          | Some doc -> stringifyMarkupContent doc) );
+      ("sortText", optWrapInQuotes c.sortText);
+      ("filterText", optWrapInQuotes c.filterText);
+      ("insertText", optWrapInQuotes c.insertText);
+      ( "insertTextFormat",
+        match c.insertTextFormat with
+        | None -> None
+        | Some insertTextFormat ->
+          Some (Printf.sprintf "%i" (insertTextFormatToInt insertTextFormat)) );
+    ]
+
+let stringifyHover value =
+  Printf.sprintf {|{"contents": %s}|}
+    (stringifyMarkupContent {kind = "markdown"; value})
 
 let stringifyLocation (h : location) =
   Printf.sprintf {|{"uri": "%s", "range": %s}|} (Json.escape h.uri)
     (stringifyRange h.range)
 
-let stringifyDocumentSymbolItem i =
-  Printf.sprintf
-    {|{
-        "name": "%s",
-        "kind": %i,
-        "location": %s
-}|}
-    (Json.escape i.name) i.kind
-    (stringifyLocation i.location)
+let stringifyDocumentSymbolItems items =
+  let buf = Buffer.create 10 in
+  let stringifyName name = Printf.sprintf "\"%s\"" (Json.escape name) in
+  let stringifyKind kind = string_of_int kind in
+  let emitStr = Buffer.add_string buf in
+  let emitSep () = emitStr ",\n" in
+  let rec emitItem ~indent item =
+    let openBrace = Printf.sprintf "%s{\n" indent in
+    let closeBrace = Printf.sprintf "\n%s}" indent in
+    let indent = indent ^ "  " in
+    let emitField name s =
+      emitStr (Printf.sprintf "%s\"%s\": %s" indent name s)
+    in
+    emitStr openBrace;
+    emitField "name" (stringifyName item.name);
+    emitSep ();
+    emitField "kind" (stringifyKind item.kind);
+    emitSep ();
+    emitField "range" (stringifyRange item.range);
+    emitSep ();
+    emitField "selectionRange" (stringifyRange item.range);
+    if item.children <> [] then (
+      emitSep ();
+      emitField "children" "[\n";
+      emitBody ~indent (List.rev item.children);
+      emitStr "]");
+    emitStr closeBrace
+  and emitBody ~indent items =
+    match items with
+    | [] -> ()
+    | item :: rest ->
+      emitItem ~indent item;
+      if rest <> [] then emitSep ();
+      emitBody ~indent rest
+  in
+  let indent = "" in
+  emitStr "[\n";
+  emitBody ~indent (List.rev items);
+  emitStr "\n]";
+  Buffer.contents buf
 
 let stringifyRenameFile {oldUri; newUri} =
   Printf.sprintf {|{

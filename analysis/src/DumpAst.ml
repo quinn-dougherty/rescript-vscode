@@ -42,7 +42,7 @@ let printAttributes attributes =
 let printConstant const =
   match const with
   | Parsetree.Pconst_integer (s, _) -> "Pconst_integer(" ^ s ^ ")"
-  | Pconst_char c -> "Pconst_char(" ^ String.make 1 c ^ ")"
+  | Pconst_char c -> "Pconst_char(" ^ String.make 1 (Char.chr c) ^ ")"
   | Pconst_string (s, delim) ->
     let delim =
       match delim with
@@ -59,10 +59,10 @@ let printCoreType typ ~pos =
   match typ.ptyp_desc with
   | Ptyp_any -> "Ptyp_any"
   | Ptyp_var name -> "Ptyp_var(" ^ str name ^ ")"
-  | Ptyp_constr (loc, _types) ->
+  | Ptyp_constr (lid, _types) ->
     "Ptyp_constr("
-    ^ (loc |> printLocDenominatorLoc ~pos)
-    ^ (Utils.flattenLongIdent loc.txt |> ident |> str)
+    ^ (lid |> printLocDenominatorLoc ~pos)
+    ^ (Utils.flattenLongIdent lid.txt |> ident |> str)
     ^ ")"
   | Ptyp_variant _ -> "Ptyp_variant(<unimplemented>)"
   | _ -> "<unimplemented_ptyp_desc>"
